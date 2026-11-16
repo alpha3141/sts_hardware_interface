@@ -108,9 +108,9 @@
       <!-- Multi-turn + sensorless homing (position mode only) -->
       <param name="multi_turn">true</param>  <!-- Sets the servo's angle limits to 0 (multi-turn, ±7.5 turns) (default: false) -->
       <param name="requires_homing">true</param>  <!-- Home against a hard stop on every activation (default: false) -->
-      <param name="homing_direction">-1</param>  <!-- Joint-space direction toward the stop: -1 = toward open/0 rad (default: -1) -->
-      <param name="homing_velocity">0.2</param>  <!-- Seek speed in rad/s - keep it slow (default: 0.5) -->
-      <param name="homing_load_threshold">0.03</param>  <!-- |load| fraction 0-1 that counts as "at the stop" (default: 0.3) -->
+      <param name="homing_direction">1</param>  <!-- Joint-space direction toward the stop: -1 = toward open/0 rad (default: -1) -->
+      <param name="homing_velocity">0.5</param>  <!-- Seek speed in rad/s - keep it slow (default: 0.5) -->
+      <param name="homing_load_threshold">0.14</param>  <!-- |load| fraction 0-1 that counts as "at the stop" (default: 0.3) -->
       <param name="homing_debounce_cycles">5</param>  <!-- Consecutive ~10 ms polls above threshold (default: 5) -->
       <param name="homing_position">0.0</param>  <!-- Joint position assigned to the stop, rad (default: 0.0) -->
       <param name="homing_backoff">0.1</param>  <!-- Retract off the stop after triggering, rad (default: 0.1) -->
