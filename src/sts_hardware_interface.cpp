@@ -12,12 +12,18 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
+
+#include "hardware_interface/types/lifecycle_state_names.hpp"
 
 namespace sts_hardware_interface
 {
 
 namespace {
+constexpr int HOMING_POLL_PERIOD_MS = 10;
+constexpr int HOMING_POSITION_TOLERANCE_STEPS = 20;
+
 // Feedback block read by read(): PRESENT_POSITION_L through PRESENT_CURRENT_H, one
 // contiguous SyncRead per cycle instead of N per-motor FeedBack() round-trips.
 constexpr u8 SYNC_READ_FEEDBACK_LEN = SMS_STS_PRESENT_CURRENT_H - SMS_STS_PRESENT_POSITION_L + 1;
@@ -472,6 +478,94 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_init(
       }
       joints_[i].eeprom[spec.reg] = val;
     }
+
+    // ===== Multi-turn and sensorless homing (commanded position-mode joints only) =====
+    auto & jc = joints_[i];
+    auto parse_bool = [&](const char * key, bool def) {
+      return joint.parameters.count(key) ? joint.parameters.at(key) == "true" : def;
+    };
+    auto parse_number = [&](const char * key, auto & out) {
+      if (!joint.parameters.count(key)) return true;
+      try {
+        if constexpr (std::is_same_v<std::decay_t<decltype(out)>, int>) {
+          out = std::stoi(joint.parameters.at(key));
+        } else {
+          out = std::stod(joint.parameters.at(key));
+        }
+        return true;
+      } catch (const std::exception &) {
+        RCLCPP_ERROR(logger_, "Joint '%s': Invalid %s value: '%s' (must be a valid number)",
+          joint.name.c_str(), key, joint.parameters.at(key).c_str());
+        return false;
+      }
+    };
+
+    jc.multi_turn = parse_bool("multi_turn", false);
+    jc.requires_homing = parse_bool("requires_homing", false);
+    jc.allow_unhomed_commands = parse_bool("allow_unhomed_commands", false);
+
+    if ((jc.multi_turn || jc.requires_homing) && (jc.operating_mode != MODE_SERVO || jc.readonly)) {
+      RCLCPP_ERROR(logger_, "Joint '%s': multi_turn / requires_homing need a commanded position-mode (%d) joint",
+        joint.name.c_str(), MODE_SERVO);
+      return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    if (jc.requires_homing) {
+      if (!parse_number("homing_direction", jc.homing_direction) ||
+        !parse_number("homing_velocity", jc.homing_velocity) ||
+        !parse_number("homing_load_threshold", jc.homing_load_threshold) ||
+        !parse_number("homing_debounce_cycles", jc.homing_debounce_cycles) ||
+        !parse_number("homing_position", jc.homing_position) ||
+        !parse_number("homing_backoff", jc.homing_backoff) ||
+        !parse_number("homing_max_travel", jc.homing_max_travel) ||
+        !parse_number("homing_timeout_s", jc.homing_timeout_s))
+      {
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+
+      const char * invalid = nullptr;
+      if (jc.homing_direction != 1 && jc.homing_direction != -1) invalid = "homing_direction must be 1 or -1";
+      else if (jc.homing_velocity <= 0.0) invalid = "homing_velocity must be > 0";
+      else if (jc.homing_load_threshold <= 0.0 || jc.homing_load_threshold > 1.0) invalid = "homing_load_threshold must be in (0, 1]";
+      else if (jc.homing_debounce_cycles < 1) invalid = "homing_debounce_cycles must be >= 1";
+      else if (jc.homing_backoff < 0.0) invalid = "homing_backoff must be >= 0";
+      else if (jc.homing_max_travel < 0.0) invalid = "homing_max_travel must be >= 0 (0 = derived from the position limits)";
+      else if (jc.homing_timeout_s <= 0.0) invalid = "homing_timeout_s must be > 0";
+      if (invalid) {
+        RCLCPP_ERROR(logger_, "Joint '%s': %s", joint.name.c_str(), invalid);
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+
+      // The joint may start anywhere in its travel, so search the full span plus a margin.
+      if (jc.homing_max_travel == 0.0) {
+        jc.homing_max_travel = 1.2 * (jc.position_max - jc.position_min);
+      }
+
+      if (jc.homing_timeout_s < jc.homing_max_travel / jc.homing_velocity) {
+        RCLCPP_WARN(logger_, "Joint '%s': homing_timeout_s (%.1f s) is shorter than a full seek "
+          "(homing_max_travel / homing_velocity = %.1f s); homing may time out before reaching the stop",
+          joint.name.c_str(), jc.homing_timeout_s, jc.homing_max_travel / jc.homing_velocity);
+      }
+
+      const double homed_position = jc.homing_position - jc.homing_direction * jc.homing_backoff;
+      if (jc.has_position_limits && (homed_position < jc.position_min || homed_position > jc.position_max)) {
+        RCLCPP_WARN(logger_, "Joint '%s': position after homing (%.3f rad = homing_position - "
+          "homing_direction * homing_backoff) is outside the position limits [%.3f, %.3f]",
+          joint.name.c_str(), homed_position, jc.position_min, jc.position_max);
+      }
+
+      RCLCPP_INFO(logger_, "Joint '%s': homing dir=%d vel=%.3f rad/s threshold=%.2f debounce=%d "
+        "position=%.3f backoff=%.3f max_travel=%.3f timeout=%.1fs allow_unhomed=%s",
+        joint.name.c_str(), jc.homing_direction, jc.homing_velocity, jc.homing_load_threshold,
+        jc.homing_debounce_cycles, jc.homing_position, jc.homing_backoff, jc.homing_max_travel,
+        jc.homing_timeout_s, jc.allow_unhomed_commands ? "true" : "false");
+    }
+
+    if (jc.multi_turn && !jc.requires_homing) {
+      RCLCPP_WARN(logger_, "Joint '%s': multi_turn without requires_homing - the turn count is not "
+        "known after a power cycle, so the reported position may be off by whole revolutions",
+        joint.name.c_str());
+    }
   }
 
   // Check for duplicate motor IDs
@@ -605,6 +699,11 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_configure(
     std::bind(&STSHardwareInterface::one_key_calibration_callback, this,
       std::placeholders::_1, std::placeholders::_2));
 
+  home_joints_service_ = node_->create_service<sts_hardware_interface::srv::HomeJoints>(
+    "/home_joints",
+    std::bind(&STSHardwareInterface::home_joints_callback, this,
+      std::placeholders::_1, std::placeholders::_2));
+
   // Enable service introspection: publishes full request/response content to
   // /emergency_stop/_service_event for monitoring activations and releases.
   //
@@ -629,7 +728,12 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_configure(
     node_->get_clock(),
     safety_qos,
     RCL_SERVICE_INTROSPECTION_CONTENTS);
-  RCLCPP_INFO(logger_, "Created /emergency_stop and /one_key_calibration services with introspection enabled");
+
+  home_joints_service_->configure_introspection(
+    node_->get_clock(),
+    safety_qos,
+    RCL_SERVICE_INTROSPECTION_CONTENTS);
+  RCLCPP_INFO(logger_, "Created /emergency_stop, /one_key_calibration and /home_joints services with introspection enabled");
 
   // Skip serial port initialization in mock mode
   if (enable_mock_mode_) {
@@ -703,6 +807,17 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_configure(
       RCLCPP_INFO(logger_, "Motor %d (joint '%s'): wrote EEPROM settings: %s",
         joint.motor_id, joint.name.c_str(), written.c_str());
     }
+
+    // Position mode clamps goals to the angle limits (default 0-4095); both 0 = multi-turn.
+    if (joint.multi_turn) {
+      if (auto r = check(servo_->WriteAngleLimits(joint.motor_id, 0, 0), "WriteAngleLimits"); r.has_value()) {
+        RCLCPP_ERROR(logger_, "Motor %d (joint '%s'): enable multi-turn: %s",
+          joint.motor_id, joint.name.c_str(), r->c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      RCLCPP_INFO(logger_, "Motor %d (joint '%s'): multi-turn enabled (angle limits set to 0)",
+        joint.motor_id, joint.name.c_str());
+    }
   }
 
   RCLCPP_INFO(logger_, "Configuration complete");
@@ -717,6 +832,21 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_activate(
   RCLCPP_INFO(
     logger_,
     "Activating STS hardware interface...");
+
+  // Runs after torque is enabled and states are reset, before hold_position seeding (which then
+  // reads positions relative to the new reference). Re-homes on every activation: with torque off
+  // while inactive, the joint may have been moved by hand.
+  auto home_required_joints = [this]() {
+    for (size_t i = 0; i < joints_.size(); ++i) {
+      if (!joints_[i].requires_homing) continue;
+      if (auto r = home_joint(i); r.has_value()) {
+        RCLCPP_ERROR(logger_, "Motor %d (joint '%s'): homing failed: %s",
+          joints_[i].motor_id, joints_[i].name.c_str(), r->c_str());
+        return false;
+      }
+    }
+    return true;
+  };
 
   // Skip hardware activation in mock mode
   if (enable_mock_mode_) {
@@ -733,6 +863,10 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_activate(
       RCLCPP_INFO(logger_, "Mock mode: Odometry initialized to zero (position and velocity)");
     } else {
       RCLCPP_INFO(logger_, "Mock mode: State reset disabled - preserving existing odometry");
+    }
+
+    if (!home_required_joints()) {
+      return hardware_interface::CallbackReturn::ERROR;
     }
 
     // Hold position: command the simulated servos to where they already are.
@@ -770,6 +904,10 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_activate(
     RCLCPP_INFO(logger_, "All motors activated and ready - odometry initialized to zero (position and velocity)");
   } else {
     RCLCPP_INFO(logger_, "All motors activated and ready - state reset disabled, preserving existing odometry");
+  }
+
+  if (!home_required_joints()) {
+    return hardware_interface::CallbackReturn::ERROR;
   }
 
   // Independent of reset_states_on_activate: that flag decides what odometry reports, this one
@@ -1150,14 +1288,18 @@ hardware_interface::return_type STSHardwareInterface::write(
 
   // ===== WRITE COMMANDS FOR SERVO MODE MOTORS =====
   if (!servo_motor_indices_.empty()) {
-    if (use_sync_write_ && servo_motor_indices_.size() > 1) {
+    // SyncWrite sends every ID, so a cycle with a gated (unhomed) joint uses individual writes.
+    const bool any_gated = std::any_of(servo_motor_indices_.begin(), servo_motor_indices_.end(),
+      [this](size_t idx) { return position_command_gated(idx); });
+    if (use_sync_write_ && servo_motor_indices_.size() > 1 && !any_gated) {
       // Pass 1: compute target positions, per-joint deltas, and max delta.
       // Delta = |target - current| in radians; used by proportional velocity scaling.
       double max_delta_rad = 0.0;
       for (size_t j = 0; j < servo_motor_indices_.size(); ++j) {
         size_t idx = servo_motor_indices_[j];
         double target_position = conversions::apply_limit(cmd_val(CMD_POSITION, idx), joints_[idx].position_min, joints_[idx].position_max, joints_[idx].has_position_limits);
-        servo_sync_positions_[j] = conversions::radians_to_raw_position(target_position, joints_[idx].position_center);
+        servo_sync_positions_[j] = conversions::radians_to_raw_position(
+          target_position, joints_[idx].position_center, raw_position_min(idx), raw_position_max(idx));
         servo_sync_deltas_[j] = std::abs(target_position - state_val(ST_POSITION, idx));
         max_delta_rad = std::max(max_delta_rad, servo_sync_deltas_[j]);
         servo_sync_accelerations_[j] = static_cast<u8>(conversions::clamp_acceleration(cmd_val(CMD_ACCELERATION, idx)));
@@ -1201,10 +1343,17 @@ hardware_interface::return_type STSHardwareInterface::write(
     } else {
       // Individual writes for single servo motor or when SyncWrite disabled
       for (size_t idx : servo_motor_indices_) {
+        if (position_command_gated(idx)) {
+          RCLCPP_WARN_THROTTLE(logger_, throttle_clock_, 5000,
+            "Joint '%s' is not homed - ignoring its position commands (call /home_joints, or set "
+            "allow_unhomed_commands=true to override)", joints_[idx].name.c_str());
+          continue;
+        }
         double target_position = conversions::apply_limit(cmd_val(CMD_POSITION, idx), joints_[idx].position_min, joints_[idx].position_max, joints_[idx].has_position_limits);
         double max_speed = conversions::apply_limit(cmd_val(CMD_VELOCITY, idx), 0.0, joints_[idx].velocity_max, joints_[idx].has_velocity_limits);
 
-        int raw_position = conversions::radians_to_raw_position(target_position, joints_[idx].position_center);
+        int raw_position = conversions::radians_to_raw_position(
+          target_position, joints_[idx].position_center, raw_position_min(idx), raw_position_max(idx));
         // rad_s_to_raw_speed: unsigned magnitude conversion for position mode — no sign inversion.
         // velocity command == 0.0 (not declared / not written) → raw 0 = STS protocol max speed.
         int raw_max_speed = conversions::rad_s_to_raw_speed(
@@ -1375,6 +1524,7 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_cleanup(
   // Cleanup ROS 2 node and service
   emergency_stop_service_.reset();
   one_key_calibration_service_.reset();
+  home_joints_service_.reset();
   node_.reset();
   RCLCPP_INFO(logger_, "Released ROS 2 node and service resources");
 
@@ -1416,6 +1566,7 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_shutdown(
   // Cleanup ROS 2 node and service
   emergency_stop_service_.reset();
   one_key_calibration_service_.reset();
+  home_joints_service_.reset();
   node_.reset();
   RCLCPP_INFO(logger_, "Released ROS 2 node and service resources");
 
@@ -1499,6 +1650,7 @@ void STSHardwareInterface::process_pending_one_key_calibration()
       all_ok = false;
       continue;
     }
+    invalidate_homing(idx, "one-key calibration");
 
     if (auto r = check(servo_->FeedBack(motor_id), "FeedBack"); r.has_value()) {
       RCLCPP_ERROR(logger_, "One-key calibration: feedback verify failed on motor %d (%s)",
@@ -1566,6 +1718,7 @@ void STSHardwareInterface::process_pending_one_key_calibration_mock()
     put_state(ST_POSITION, idx, conversions::raw_position_to_radians(
         conversions::STS_MIDPOINT_RAW_POSITION, joints_[idx].position_center));
     put_cmd(CMD_POSITION, idx, state_val(ST_POSITION, idx));  // Hold at the new calibrated position
+    invalidate_homing(idx, "one-key calibration");
 
     RCLCPP_INFO(logger_, "One-key calibration (mock): motor %d (joint '%s') position set to raw step %d",
       joints_[idx].motor_id, joints_[idx].name.c_str(), conversions::STS_MIDPOINT_RAW_POSITION);
@@ -1675,6 +1828,213 @@ bool STSHardwareInterface::seed_servo_commands_from_feedback()
   return true;
 }
 
+int STSHardwareInterface::raw_position_min(size_t idx) const
+{
+  return joints_[idx].multi_turn ? -conversions::STS_MULTI_TURN_MAX_POSITION : 0;
+}
+
+int STSHardwareInterface::raw_position_max(size_t idx) const
+{
+  return joints_[idx].multi_turn ? conversions::STS_MULTI_TURN_MAX_POSITION : conversions::STS_MAX_POSITION;
+}
+
+bool STSHardwareInterface::position_command_gated(size_t idx) const
+{
+  const auto & joint = joints_[idx];
+  return joint.requires_homing && !joint.is_homed && !joint.allow_unhomed_commands;
+}
+
+void STSHardwareInterface::invalidate_homing(size_t idx, const char * reason)
+{
+  auto & joint = joints_[idx];
+  if (!joint.requires_homing || !joint.is_homed) return;
+  joint.is_homed = false;
+  RCLCPP_WARN(logger_, "Joint '%s': position reference invalidated by %s - call /home_joints to re-home",
+    joint.name.c_str(), reason);
+}
+
+/** @brief Blocking sensorless homing: seek the hard stop by load, set the reference, back off */
+Result STSHardwareInterface::home_joint(size_t idx)
+{
+  auto & joint = joints_[idx];
+  joint.is_homed = false;
+
+  if (enable_mock_mode_) {
+    const double homed_position = joint.homing_position - joint.homing_direction * joint.homing_backoff;
+    put_state(ST_POSITION, idx, homed_position);
+    put_state(ST_VELOCITY, idx, 0.0);
+    put_cmd(CMD_POSITION, idx, homed_position);
+    joint.is_homed = true;
+    RCLCPP_INFO(logger_, "Joint '%s' homed (mock mode): position %.3f rad", joint.name.c_str(), homed_position);
+    return std::nullopt;
+  }
+
+  const int id = joint.motor_id;
+  // Positive joint motion is negative raw motion (REP-103 inversion in raw_position_to_radians).
+  const int raw_dir = -joint.homing_direction;
+  // Raw speed 0 would mean "maximum speed", so never let a slow homing velocity round down to it.
+  const u16 speed = static_cast<u16>(std::max(1,
+    conversions::rad_s_to_raw_speed(joint.homing_velocity, joint.max_velocity_steps)));
+  const u8 acc = static_cast<u8>(DEFAULT_ACCELERATION);
+  const auto to_steps = [](double rad) { return static_cast<int>(std::lround(rad * conversions::RAD_TO_STEPS)); };
+  const auto clamp_raw = [&](int raw) { return std::clamp(raw, raw_position_min(idx), raw_position_max(idx)); };
+
+  int raw_pos = 0;
+  double load = 0.0;
+  auto read_feedback = [&]() -> Result {
+    for (int attempt = 0; attempt < MAX_CONSECUTIVE_ERRORS; ++attempt) {
+      if (servo_->FeedBack(id) == 1) {
+        raw_pos = servo_->ReadPos(-1);
+        load = std::abs(servo_->ReadLoad(-1)) * LOAD_SCALE / 100.0;
+        return std::nullopt;
+      }
+    }
+    return "feedback read failed " + std::to_string(MAX_CONSECUTIVE_ERRORS) + " times in a row";
+  };
+  // Best effort: hold wherever the joint is now so it stops pushing.
+  auto hold_here = [&]() { (void)servo_->WritePosEx(id, raw_pos, speed, acc); };
+  auto timeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(joint.homing_timeout_s));
+
+  // ===== Phase 1: seek the hard stop =====
+  if (auto r = read_feedback(); r.has_value()) return "initial " + *r;
+
+  // A far-away position target at homing speed: the servo stays in position mode, so no mode
+  // switch (EEPROM write) is needed, and the target doubles as the max-travel guard.
+  const int seek_target = clamp_raw(raw_pos + raw_dir * to_steps(joint.homing_max_travel));
+  if (auto r = check(servo_->WritePosEx(id, seek_target, speed, acc), "WritePosEx (seek)"); r.has_value()) {
+    return r;
+  }
+  // Angle limits read back from the servo: both must be 0 for multi-turn goals to be honored.
+  RCLCPP_INFO(logger_, "Joint '%s': homing - seeking hard stop (direction %d, %.3f rad/s, load threshold %.2f): "
+    "raw %d -> target %d, servo angle limits [%d, %d]",
+    joint.name.c_str(), joint.homing_direction, joint.homing_velocity, joint.homing_load_threshold,
+    raw_pos, seek_target,
+    servo_->readWord(static_cast<u8>(id), SMS_STS_MIN_ANGLE_LIMIT_L),
+    servo_->readWord(static_cast<u8>(id), SMS_STS_MAX_ANGLE_LIMIT_L));
+
+  int cycles_over_threshold = 0;
+  double peak_load = 0.0;
+  int longest_streak = 0;
+  // Reported on failure, so homing_load_threshold / homing_debounce_cycles can be tuned from the log.
+  auto load_summary = [&]() {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "peak load %.2f (threshold %.2f), longest streak over threshold %d/%d polls",
+      peak_load, joint.homing_load_threshold, longest_streak, joint.homing_debounce_cycles);
+    return std::string(buf);
+  };
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (cycles_over_threshold < joint.homing_debounce_cycles) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      hold_here();
+      return "no hard stop detected within homing_timeout_s (" + std::to_string(joint.homing_timeout_s) +
+             " s); " + load_summary();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(HOMING_POLL_PERIOD_MS));
+    if (auto r = read_feedback(); r.has_value()) {
+      hold_here();
+      return r;
+    }
+    cycles_over_threshold = (load >= joint.homing_load_threshold) ? cycles_over_threshold + 1 : 0;
+    peak_load = std::max(peak_load, load);
+    longest_streak = std::max(longest_streak, cycles_over_threshold);
+    if (cycles_over_threshold == 0 && std::abs(raw_pos - seek_target) <= HOMING_POSITION_TOLERANCE_STEPS) {
+      hold_here();
+      return "travelled homing_max_travel (" + std::to_string(joint.homing_max_travel) +
+             " rad) without the load reaching homing_load_threshold; " + load_summary();
+    }
+  }
+
+  // ===== Phase 2: the stop becomes homing_position =====
+  const int raw_stop = raw_pos;
+  hold_here();
+  joint.position_center = raw_stop + to_steps(joint.homing_position);
+  RCLCPP_INFO(logger_, "Joint '%s': hard stop at raw %d (load %.2f) -> %.3f rad, position_center=%d",
+    joint.name.c_str(), raw_stop, load, joint.homing_position, joint.position_center);
+
+  // ===== Phase 3: back off the stop =====
+  const int backoff_target = clamp_raw(raw_stop - raw_dir * to_steps(joint.homing_backoff));
+  if (auto r = check(servo_->WritePosEx(id, backoff_target, speed, acc), "WritePosEx (backoff)"); r.has_value()) {
+    return r;
+  }
+  RCLCPP_INFO(logger_, "Joint '%s': homing - backing off: raw %d -> target %d",
+    joint.name.c_str(), raw_stop, backoff_target);
+  deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::abs(raw_pos - backoff_target) > HOMING_POSITION_TOLERANCE_STEPS) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      hold_here();
+      return "backoff did not reach its target within homing_timeout_s";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(HOMING_POLL_PERIOD_MS));
+    if (auto r = read_feedback(); r.has_value()) {
+      hold_here();
+      return r;
+    }
+  }
+
+  put_state(ST_POSITION, idx, conversions::raw_position_to_radians(raw_pos, joint.position_center));
+  put_state(ST_VELOCITY, idx, 0.0);
+  // Command what the servo is already holding, so the first write() does not move it.
+  put_cmd(CMD_POSITION, idx, conversions::raw_position_to_radians(backoff_target, joint.position_center));
+  joint.is_homed = true;
+  RCLCPP_INFO(logger_, "Joint '%s' homed: position %.3f rad", joint.name.c_str(), state_val(ST_POSITION, idx));
+  return std::nullopt;
+}
+
+/** @brief Home the requested joints; blocks the control loop (runs inside read()'s spin_some) */
+void STSHardwareInterface::home_joints_callback(
+  const sts_hardware_interface::srv::HomeJoints::Request::SharedPtr req,
+  sts_hardware_interface::srv::HomeJoints::Response::SharedPtr res)
+{
+  res->success = false;
+
+  // read() (and so this callback) also runs while inactive, when torque is off.
+  if (get_lifecycle_state().label() != hardware_interface::lifecycle_state_names::ACTIVE) {
+    res->message = "Hardware interface is not active.";
+    return;
+  }
+  if (emergency_stop_requested_ || emergency_stop_active_) {
+    res->message = "Emergency stop is active.";
+    return;
+  }
+  if (calibration_queued_.load(std::memory_order_acquire)) {
+    res->message = "A one-key calibration is queued; retry after it completes.";
+    return;
+  }
+
+  std::vector<size_t> targets;
+  if (req->motor_ids.empty()) {
+    for (size_t idx = 0; idx < joints_.size(); ++idx) {
+      if (joints_[idx].requires_homing) targets.push_back(idx);
+    }
+  } else {
+    for (uint16_t requested_id : req->motor_ids) {
+      auto it = std::find_if(joints_.begin(), joints_.end(),
+        [requested_id](const JointConfig & j) { return j.motor_id == static_cast<int>(requested_id); });
+      if (it == joints_.end() || !it->requires_homing) {
+        res->message = "motor_id " + std::to_string(requested_id) + " is unknown or not configured with requires_homing";
+        return;
+      }
+      const size_t idx = static_cast<size_t>(std::distance(joints_.begin(), it));
+      if (std::find(targets.begin(), targets.end(), idx) == targets.end()) targets.push_back(idx);
+    }
+  }
+  if (targets.empty()) {
+    res->message = "No joints are configured with requires_homing.";
+    return;
+  }
+
+  for (size_t idx : targets) {
+    if (auto r = home_joint(idx); r.has_value()) {
+      res->message = "Joint '" + joints_[idx].name + "' homing failed: " + *r;
+      RCLCPP_ERROR(logger_, "%s", res->message.c_str());
+      return;
+    }
+  }
+  res->success = true;
+  res->message = "Homed " + std::to_string(targets.size()) + " joint(s).";
+}
+
 /** @brief Attempt to recover from communication errors by pinging motors */
 bool STSHardwareInterface::attempt_error_recovery()
 {
@@ -1720,6 +2080,11 @@ bool STSHardwareInterface::attempt_error_recovery()
       RCLCPP_ERROR(logger_, "Failed to reinitialize motor %d (joint '%s') after recovery: %s",
         joints_[i].motor_id, joints_[i].name.c_str(), r->c_str());
       return false;
+    }
+
+    // A dropout may have been a servo power loss, which resets the multi-turn count.
+    if (joints_[i].multi_turn) {
+      invalidate_homing(i, "communication recovery");
     }
   }
 

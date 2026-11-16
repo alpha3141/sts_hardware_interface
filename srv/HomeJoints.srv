@@ -1,0 +1,5 @@
+# Re-run sensorless homing. Empty motor_ids homes every joint with requires_homing=true.
+uint16[] motor_ids
+---
+bool success
+string message

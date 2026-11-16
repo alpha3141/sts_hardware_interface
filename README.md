@@ -8,7 +8,7 @@
 
 `ros2_control` `SystemInterface` for Feetech STS series servo motors (STS3215 and compatible).
 
-**Status:** Modes 0 (Position), 1 (Velocity) and 2 (PWM/Effort) are tested on physical hardware; torque-magnitude calibration is still in progress. `/one_key_calibration` is covered by mock-mode unit tests only and is untested on hardware.
+**Status:** Modes 0 (Position), 1 (Velocity) and 2 (PWM/Effort) are tested on physical hardware; torque-magnitude calibration is still in progress. `/one_key_calibration`, multi-turn joints and sensorless homing (`/home_joints`) are covered by mock-mode unit tests only and are untested on hardware.
 
 ## Features
 
@@ -17,6 +17,7 @@
 - **State feedback:** position, velocity, load, voltage, temperature, current, motion status
 - **Safety:** broadcast emergency stop, hardware limits, automatic error recovery
 - **EEPROM configuration:** optional per-joint PID and protection parameters written at startup
+- **Multi-turn and sensorless homing:** position-mode joints can span about ±7.5 turns and home against a hard stop by motor load on activation
 - **Read-only joints:** joints with no command interface have torque disabled but still report state, so a leader arm can share a bus with follower arms
 - **REP-103:** automatic direction inversion for counter-clockwise-positive rotation
 - **Mock mode:** hardware-free simulation for development and tests
@@ -121,6 +122,23 @@ Behavior:
   - If torque was disabled before calibration, it remains disabled.
 - Verification is always performed after each calibration write.
 - **Mock mode:** the request is accepted (not rejected) and simulates the servo's `CalibrationOfs` command — the joint's position state is set to the encoder midpoint (raw step 2048) without moving. Torque preservation and verification don't apply, since there's no real servo to query.
+- Calibrating a `requires_homing` joint invalidates its homing; call `/home_joints` afterwards.
+
+## Multi-Turn Joints and Sensorless Homing
+
+**Untested on hardware.** For mechanisms that need more than one servo revolution, such as a rack-and-pinion gripper:
+
+- `multi_turn=true` sets the servo's angle limits to 0, enabling multi-turn position control (about ±7.5 turns).
+- `requires_homing=true` homes the joint on every activation. It drives slowly toward a hard stop until the motor load stays above `homing_load_threshold`, assigns that point `homing_position`, then backs off by `homing_backoff`. Activation fails if no stop is found.
+- Until a joint is homed, its position commands are ignored (`allow_unhomed_commands=true` overrides this).
+
+The servo loses its turn count when powered off, which is why multi-turn joints should always be homed. To re-home without re-activating (this blocks the control loop while it runs):
+
+```bash
+ros2 service call /home_joints sts_hardware_interface/srv/HomeJoints "{motor_ids: []}"
+```
+
+See [config/gripper_rack_pinion.urdf.xacro](config/gripper_rack_pinion.urdf.xacro) for an example and the [design doc](docs/design.md#multi-turn-joints-and-sensorless-homing) for the full procedure and tuning advice.
 
 ## Motor Diagnostics Node
 
@@ -211,6 +229,17 @@ This node is recommended for all robots using STS motors to ensure safe operatio
 | `internal_max_acc` | int | *(omit)* | Internal acceleration cap register written to EEPROM (0–254), addr 85. Firmware-dependent on STS models. Omit to preserve existing EEPROM value. |
 | `internal_acc_coeff` | int | *(omit)* | Internal acceleration-profile coefficient written to EEPROM (0–254), addr 86. Firmware-dependent on STS models. Omit to preserve existing EEPROM value. |
 | `internal_control_period` | int | *(omit)* | Internal control-loop period register written to EEPROM (1–254), addr 81. Firmware-dependent on STS models. Omit to preserve existing EEPROM value. |
+| `multi_turn` | bool | false | Mode 0 only. Sets the servo's angle limits to 0 (EEPROM), enabling multi-turn position control (±30719 steps, about ±7.5 turns). |
+| `requires_homing` | bool | false | Mode 0 only. Home against a hard stop on every activation; position commands are ignored until homed. |
+| `allow_unhomed_commands` | bool | false | Send position commands before the joint is homed. |
+| `homing_direction` | int | -1 | Joint-space direction toward the hard stop (-1 or 1). |
+| `homing_velocity` | double | 0.5 | Seek and backoff speed (rad/s, > 0). |
+| `homing_load_threshold` | double | 0.3 | `\|load\|` (0–1, same scale as `effort`) that counts as "at the stop". |
+| `homing_debounce_cycles` | int | 5 | Consecutive ~10 ms polls above the threshold needed to trigger (≥ 1). |
+| `homing_position` | double | 0.0 | Joint position (rad) assigned to the hard stop. |
+| `homing_backoff` | double | 0.1 | Distance (rad) to retract from the stop after triggering. |
+| `homing_max_travel` | double | 1.2 × position range | Distance (rad) searched before homing fails (0 = default). |
+| `homing_timeout_s` | double | 15.0 | Time limit (s) for each phase (seek, backoff). |
 
 **Readonly joints:** A joint with **no `<command_interface>` entries** is treated as readonly. It still requires `motor_id` and `operating_mode` (the mode register is written to EEPROM so state feedback is interpreted correctly), but torque is disabled at activation and the joint is excluded from all write loops. All 7 state interfaces are still exported and read every cycle.
 

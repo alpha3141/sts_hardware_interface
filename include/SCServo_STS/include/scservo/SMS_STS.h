@@ -276,6 +276,8 @@ class SMS_STS : public SCSerial
 	virtual int ReadReturnDelay(u8 ID);
 	virtual int WriteDeadband(u8 ID, u8 value);
 	virtual int ReadDeadband(u8 ID);
+	/** @brief Write min/max angle limits (addr 9-12). Both 0 enables multi-turn position control in Mode 0. */
+	virtual int WriteAngleLimits(u8 ID, u16 minLimit, u16 maxLimit);
 	virtual int WriteMovingThreshold(u8 ID, u8 value);
 	virtual int ReadMovingThreshold(u8 ID);
 	virtual int WriteDTS(u8 ID, u8 value);

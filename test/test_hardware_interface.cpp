@@ -2295,6 +2295,111 @@ TEST_F(HardwareInterfaceMockTest, VelocityModeMotorCanBeExplicitlyCalibrated) {
   EXPECT_TRUE(res->accepted);
 }
 
+// ---- multi-turn and sensorless homing ----
+
+/// Servo joint with multi-turn homing toward the 0 rad stop, 0.25 rad backoff, limits [0, 4π].
+hardware_interface::HardwareInfo make_homing_servo_info()
+{
+  auto info = make_servo_info_with_vel_acc();
+  auto & p = info.joints[0].parameters;
+  p["multi_turn"] = "true";
+  p["requires_homing"] = "true";
+  p["homing_direction"] = "-1";
+  p["homing_position"] = "0.0";
+  p["homing_backoff"] = "0.25";
+  p["min_position"] = "0.0";
+  p["max_position"] = std::to_string(4.0 * M_PI);
+  return info;
+}
+
+/** @brief Homing parameters on a non-position joint are rejected */
+TEST(HardwareInterfaceHomingInitTest, HomingRequiresPositionMode) {
+  for (const char * key : {"requires_homing", "multi_turn"}) {
+    sts_hardware_interface::STSHardwareInterface hw;
+    auto info = make_valid_single_motor_info();  // velocity mode
+    info.joints[0].parameters[key] = "true";
+    EXPECT_EQ(init_hw(hw, info), CallbackReturn::ERROR) << key;
+  }
+}
+
+/** @brief Out-of-range homing parameters are rejected */
+TEST(HardwareInterfaceHomingInitTest, InvalidHomingParametersReturnError) {
+  const std::vector<std::pair<std::string, std::string>> bad = {
+    {"homing_direction", "0"}, {"homing_direction", "2"}, {"homing_velocity", "0"},
+    {"homing_load_threshold", "0"}, {"homing_load_threshold", "1.5"},
+    {"homing_debounce_cycles", "0"}, {"homing_backoff", "-0.1"}, {"homing_max_travel", "-1"},
+    {"homing_timeout_s", "0"}, {"homing_velocity", "fast"}};
+  for (const auto & [key, value] : bad) {
+    sts_hardware_interface::STSHardwareInterface hw;
+    auto info = make_homing_servo_info();
+    info.joints[0].parameters[key] = value;
+    EXPECT_EQ(init_hw(hw, info), CallbackReturn::ERROR) << key << "=" << value;
+  }
+}
+
+/** @brief Valid homing configuration initialises */
+TEST(HardwareInterfaceHomingInitTest, ValidHomingConfigurationSucceeds) {
+  sts_hardware_interface::STSHardwareInterface hw;
+  EXPECT_EQ(init_hw(hw, make_homing_servo_info()), CallbackReturn::SUCCESS);
+}
+
+class HardwareInterfaceHomingMockTest : public HardwareInterfaceMockTest
+{
+protected:
+  hardware_interface::HardwareInfo make_info() override { return make_homing_servo_info(); }
+};
+
+/** @brief Activation homes the joint: position state and command sit at the backed-off position */
+TEST_F(HardwareInterfaceHomingMockTest, ActivationHomesJoint) {
+  double pos = -1.0;
+  double cmd = -1.0;
+  ASSERT_NE(find_state("position"), nullptr);
+  ASSERT_NE(find_cmd("position"), nullptr);
+  (void)find_state("position")->get_value(pos, true);
+  (void)find_cmd("position")->get_value(cmd, true);
+  // homing_position - homing_direction * homing_backoff = 0.0 - (-1)(0.25)
+  EXPECT_NEAR(pos, 0.25, 1e-9);
+  EXPECT_NEAR(cmd, 0.25, 1e-9);
+}
+
+/** @brief After homing, commands beyond one revolution are followed */
+TEST_F(HardwareInterfaceHomingMockTest, HomedJointFollowsMultiTurnCommand) {
+  auto * pos_cmd = find_cmd("position");
+  ASSERT_NE(pos_cmd, nullptr);
+  (void)pos_cmd->set_value(3.0 * M_PI);
+  rclcpp::Time t(0, 0, RCL_ROS_TIME);
+  rclcpp::Duration d(0, 0);
+  EXPECT_EQ(hw_->write(t, d), return_type::OK);
+  EXPECT_EQ(hw_->read(t, d), return_type::OK);
+  double pos = 0.0;
+  (void)find_state("position")->get_value(pos, true);
+  EXPECT_NEAR(pos, 3.0 * M_PI, 1e-9);
+}
+
+/** @brief /home_joints refuses to run unless the framework has the component active */
+TEST_F(HardwareInterfaceHomingMockTest, HomeJointsServiceRejectedWhenNotActive) {
+  // The fixture calls on_activate() directly, so the framework lifecycle state is not "active".
+  auto client_node = rclcpp::Node::make_shared("test_home_joints_client_node");
+  auto client = client_node->create_client<sts_hardware_interface::srv::HomeJoints>("/home_joints");
+  ASSERT_TRUE(client->wait_for_service(std::chrono::seconds(5)));
+
+  auto future = client->async_send_request(
+    std::make_shared<sts_hardware_interface::srv::HomeJoints::Request>());
+  rclcpp::Time t(0, 0, RCL_ROS_TIME);
+  rclcpp::Duration d(0, 0);
+  sts_hardware_interface::srv::HomeJoints::Response::SharedPtr res;
+  for (int i = 0; i < 50 && !res; ++i) {
+    rclcpp::spin_some(client_node);
+    hw_->read(t, d);
+    if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+      res = future.get();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_NE(res, nullptr) << "service call timed out";
+  EXPECT_FALSE(res->success);
+}
+
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);

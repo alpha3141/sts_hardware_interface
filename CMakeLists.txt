@@ -42,6 +42,7 @@ find_package(control_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/OneKeyCalibration.srv"
+  "srv/HomeJoints.srv"
 )
 
 # Build SCServo_STS library (C++)

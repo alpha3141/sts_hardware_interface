@@ -24,6 +24,7 @@
 #include "rclcpp/time.hpp"
 #include "rclcpp_lifecycle/state.hpp"
 #include "std_srvs/srv/set_bool.hpp"
+#include "sts_hardware_interface/srv/home_joints.hpp"
 #include "sts_hardware_interface/srv/one_key_calibration.hpp"
 #include "sts_hardware_interface/sts_conversions.hpp"
 
@@ -49,7 +50,12 @@ using Result = std::optional<std::string>;
  * still read every cycle (e.g. a teleoperation leader arm).
  *
  * Services: /emergency_stop (std_srvs/SetBool) stops all motors; /one_key_calibration
- * (OneKeyCalibration) sets the current position as the encoder midpoint.
+ * (OneKeyCalibration) sets the current position as the encoder midpoint; /home_joints
+ * (HomeJoints) re-runs sensorless homing.
+ *
+ * Position-mode joints may be multi-turn (`multi_turn`) and/or require sensorless homing
+ * (`requires_homing`): on activation the joint is driven slowly against its hard stop until the
+ * load threshold is exceeded, and that point becomes the joint's position reference.
  *
  * Hardware and joint parameters: docs/design.md, section "Configuration Parameters".
  */
@@ -286,6 +292,20 @@ private:
     int position_center = conversions::STS_DEFAULT_CENTER;  // Raw step for 0 rad
     int max_velocity_steps = DEFAULT_MAX_VELOCITY_STEPS;    // Motor max velocity, steps/s (model-dependent)
     std::array<std::optional<int>, EEPROM_REG_COUNT> eeprom;  // Unset = leave the servo's value alone
+
+    // Multi-turn and sensorless homing (MODE_SERVO only)
+    bool multi_turn = false;              // Angle limits set to 0 in on_configure; raw range ±STS_MULTI_TURN_MAX_POSITION
+    bool requires_homing = false;         // Home in on_activate; position commands gated until homed
+    bool allow_unhomed_commands = false;  // Let position commands through before homing
+    int homing_direction = -1;            // Joint-space direction (±1) toward the hard stop
+    double homing_velocity = 0.5;         // rad/s
+    double homing_load_threshold = 0.3;   // |load| fraction [0, 1] that counts as "at the stop"
+    int homing_debounce_cycles = 5;       // Consecutive polls over threshold before triggering
+    double homing_position = 0.0;         // Joint position (rad) assigned to the hard stop
+    double homing_backoff = 0.1;          // rad retracted off the stop after triggering
+    double homing_max_travel = 0.0;       // rad searched before giving up (0 = derived in on_init)
+    double homing_timeout_s = 15.0;       // Per phase (seek, backoff)
+    bool is_homed = false;                // Runtime state, not a parameter
   };
 
   std::vector<JointConfig> joints_;  // One entry per URDF joint, in URDF order
@@ -296,6 +316,25 @@ private:
 
   /** @brief Attempt to recover from communication errors by pinging motors */
   bool attempt_error_recovery();
+
+  /** @brief Blocking sensorless homing of one joint: seek the hard stop by load, set the
+   *  position reference there, back off. Seeds the joint's position state and command. */
+  [[nodiscard]] Result home_joint(size_t idx);
+
+  /** @brief Raw position clamp range for a joint: single-turn [0, 4095] or multi-turn */
+  int raw_position_min(size_t idx) const;
+  int raw_position_max(size_t idx) const;
+
+  /** @brief True if the joint requires homing, is not homed, and does not allow unhomed commands */
+  bool position_command_gated(size_t idx) const;
+
+  /** @brief Clear is_homed on joints whose position reference may no longer be valid */
+  void invalidate_homing(size_t idx, const char * reason);
+
+  /** @brief Home joints on request; blocks the control loop for the duration */
+  void home_joints_callback(
+    const sts_hardware_interface::srv::HomeJoints::Request::SharedPtr req,
+    sts_hardware_interface::srv::HomeJoints::Response::SharedPtr res);
 
   /** @brief Stop a motor based on its operating mode */
   int stop_motor(size_t idx, int acceleration = 0);
@@ -334,6 +373,7 @@ private:
   bool calibration_in_progress_{false};
 
   rclcpp::Service<sts_hardware_interface::srv::OneKeyCalibration>::SharedPtr one_key_calibration_service_;
+  rclcpp::Service<sts_hardware_interface::srv::HomeJoints>::SharedPtr home_joints_service_;
 };
 
 }  // namespace sts_hardware_interface

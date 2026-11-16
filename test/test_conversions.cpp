@@ -277,6 +277,21 @@ TEST(ConversionsTest, CustomCenter_RoundtripAndClamping) {
   }
 }
 
+/** @brief A multi-turn raw range lets targets beyond one revolution through, including negative steps */
+TEST(ConversionsTest, MultiTurnRange_PassesBeyondOneRevolution) {
+  constexpr int lo = -STS_MULTI_TURN_MAX_POSITION;
+  constexpr int hi = STS_MULTI_TURN_MAX_POSITION;
+  // 720° from center 4095: 4095 - 8192 = -4097
+  EXPECT_EQ(radians_to_raw_position(4.0 * M_PI, 4095, lo, hi), -4097);
+  EXPECT_EQ(radians_to_raw_position(-4.0 * M_PI, 0, lo, hi), 8192);
+  EXPECT_NEAR(raw_position_to_radians(-4097, 4095), 4.0 * M_PI, 1e-9);
+  // Still clamped at the multi-turn bounds
+  EXPECT_EQ(radians_to_raw_position(1000.0, 0, lo, hi), lo);
+  EXPECT_EQ(radians_to_raw_position(-1000.0, 0, lo, hi), hi);
+  // The default range is unchanged single-turn
+  EXPECT_EQ(radians_to_raw_position(4.0 * M_PI, 4095), 0);
+}
+
 // ---- decode_servo_error ----
 
 /** @brief Decode servo error: zero, is ok */

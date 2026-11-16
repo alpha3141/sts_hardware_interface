@@ -1,0 +1,60 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz - Control loop frequency
+
+    # Joint State Broadcaster - Publishes joint states to /joint_states
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # State Interfaces Broadcaster - Publishes health interfaces for motor_diagnostics_node
+    state_interfaces_broadcaster:
+      type: state_interfaces_broadcaster/StateInterfacesBroadcaster
+
+    # Gripper Controller - Commands the pinion angle (radians) via trajectory execution.
+    # The URDF's <transmission> is not applied by ros2_control, so controllers work on the
+    # actuator joint gripper_motor_joint, not on the rack joint gripper_joint (meters).
+    gripper_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+# Joint State Broadcaster configuration
+joint_state_broadcaster:
+  ros__parameters:
+    joints:
+      - gripper_motor_joint
+
+    interfaces:
+      - position
+      - velocity
+      - effort
+
+# State Interfaces Broadcaster configuration
+state_interfaces_broadcaster:
+  ros__parameters:
+    interfaces:
+      - gripper_motor_joint/effort
+      - gripper_motor_joint/voltage
+      - gripper_motor_joint/temperature
+      - gripper_motor_joint/current
+      - gripper_motor_joint/is_moving
+
+# Gripper Controller configuration (Mode 0: Position/Servo, multi-turn)
+gripper_controller:
+  ros__parameters:
+    joints:
+      - gripper_motor_joint
+
+    command_interfaces:
+      - position  # Target pinion angle in radians (0 = open stop after homing)
+      - velocity  # Max speed in rad/s
+
+    state_interfaces:
+      - position
+      - velocity
+
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+
+    allow_partial_joints_goal: false
+    constraints:
+      stopped_velocity_tolerance: 0.01  # rad/s
+      goal_time: 0.0  # 0 = no timeout

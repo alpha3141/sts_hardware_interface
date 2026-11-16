@@ -531,6 +531,22 @@ int SMS_STS::WriteDeadband(u8 ID, u8 value)
 	return LockEeprom(ID);
 }
 
+int SMS_STS::WriteAngleLimits(u8 ID, u16 minLimit, u16 maxLimit)
+{
+	if (unLockEeprom(ID) != 1) {
+		return 0;
+	}
+	if (writeWord(ID, SMS_STS_MIN_ANGLE_LIMIT_L, minLimit) != 1) {
+		LockEeprom(ID);
+		return 0;
+	}
+	if (writeWord(ID, SMS_STS_MAX_ANGLE_LIMIT_L, maxLimit) != 1) {
+		LockEeprom(ID);
+		return 0;
+	}
+	return LockEeprom(ID);
+}
+
 int SMS_STS::ReadDeadband(u8 ID)
 {
 	return readByteRegister(*this, ID, SMS_STS_CW_DEAD);

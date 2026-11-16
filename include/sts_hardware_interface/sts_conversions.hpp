@@ -30,6 +30,9 @@ constexpr int    STS_DEFAULT_CENTER   = 4095;   // Default: 0 rad at step 4095, 
 constexpr int    STS_MAX_PWM          = 1000;   // ±100% duty cycle
 constexpr int    STS_MAX_ACCELERATION = 254;    // protocol constant
 constexpr int    STS_MIDPOINT_RAW_POSITION = 2048;  // Encoder midpoint; one-key calibration (CalibrationOfs) resets current position to this raw step
+// Multi-turn goal range (angle limits both 0): ±30719 steps ≈ ±7.5 turns per the Feetech memory
+// table. The wire format (sign bit 15) could encode ±32767; the firmware range is the tighter bound.
+constexpr int    STS_MULTI_TURN_MAX_POSITION = 30719;
 
 /**
  * @brief Convert motor steps [0, 4095] to radians with configurable center.
@@ -43,17 +46,20 @@ inline double raw_position_to_radians(int raw_position, int center = STS_DEFAULT
 }
 
 /**
- * @brief Convert radians to motor steps [0, 4095] with configurable center.
+ * @brief Convert radians to motor steps with configurable center.
  *
  * `center` is the raw encoder step that maps to 0 rad (default: STS_DEFAULT_CENTER = 4095).
- * Values outside the physical encoder range are clamped (not wrapped) to [0, 4095].
+ * The result is clamped (not wrapped) to [min_raw, max_raw]: [0, 4095] for single-turn joints,
+ * [-STS_MULTI_TURN_MAX_POSITION, STS_MULTI_TURN_MAX_POSITION] for multi-turn joints.
  * Clamping is intentional: the old fmod-based wrapping silently mapped negative
  * angles to the wrong end of the encoder, causing full-revolution traversals.
  */
-inline int radians_to_raw_position(double position_rad, int center = STS_DEFAULT_CENTER)
+inline int radians_to_raw_position(
+  double position_rad, int center = STS_DEFAULT_CENTER,
+  int min_raw = 0, int max_raw = STS_MAX_POSITION)
 {
   double steps = std::round(static_cast<double>(center) - position_rad * RAD_TO_STEPS);
-  return static_cast<int>(std::clamp(steps, 0.0, static_cast<double>(STS_MAX_POSITION)));
+  return static_cast<int>(std::clamp(steps, static_cast<double>(min_raw), static_cast<double>(max_raw)));
 }
 
 /**

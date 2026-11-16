@@ -1,0 +1,149 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="gripper_rack_pinion">
+
+  <!-- Arguments -->
+  <xacro:arg name="serial_port" default="/dev/ttyACM0"/>
+  <xacro:arg name="motor_id" default="1"/>
+  <xacro:arg name="baud_rate" default="1000000"/>
+  <xacro:arg name="use_mock" default="false"/>
+
+  <!--
+    Rack-and-pinion gripper example.
+
+    The STS servo is a rotary actuator: sts_hardware_interface only ever drives
+    gripper_motor_joint, in radians, exactly like any other joint in this package.
+    gripper_joint is the rack, a prismatic joint in meters; it is NOT seen by the
+    hardware interface at all. The <transmission> below documents the ratio between
+    the two, but ros2_control does NOT apply it: controllers must command
+    gripper_motor_joint in radians (see gripper_rack_pinion_controllers.yaml), and
+    gripper_joint gets no state, so robot_state_publisher has no TF for the finger.
+
+    mechanicalReduction here is (actuator radians) / (joint meters), i.e. how many
+    radians of pinion rotation correspond to 1 meter of rack travel:
+        mechanicalReduction = 2 * pi / pitch_per_revolution_m
+    Example: a pinion that advances the rack 0.0314 m (31.4 mm) per full revolution
+    (2*pi rad) gives mechanicalReduction = (2*pi) / 0.0314 ≈ 200.
+    Measure pitch_per_revolution_m from the actual pinion (pitch diameter * pi),
+    or compute it from module/number of teeth if you have the gear spec.
+  -->
+  <xacro:property name="rack_pitch_per_rev_m" value="0.0314"/>
+  <xacro:property name="gripper_mechanical_reduction" value="${(2 * pi) / rack_pitch_per_rev_m}"/>
+
+  <!-- Rack travel limits, in meters, at the joint (not the actuator) -->
+  <xacro:property name="gripper_open_m" value="0.0"/>
+  <xacro:property name="gripper_closed_m" value="0.04"/>
+
+  <!-- Actuator travel in radians. Above 2*pi the servo must run multi-turn (multi_turn=true
+       below), and its turn count after a power cycle is unknown, so the joint is homed against
+       the open hard stop on every activation (requires_homing=true). -->
+  <xacro:property name="gripper_motor_max_rad" value="${gripper_closed_m * gripper_mechanical_reduction}"/>
+
+  <!-- Robot description -->
+  <link name="base_link"/>
+
+  <link name="gripper_motor_link"/>  <!-- Rotary actuator link: the servo shaft/pinion -->
+
+  <link name="gripper_finger_link"/>  <!-- Rack / moving finger -->
+
+  <!-- Actuator joint: this is the joint sts_hardware_interface drives directly, in radians,
+       and the joint the controllers command. -->
+  <joint name="gripper_motor_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="gripper_motor_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0.0" upper="${gripper_motor_max_rad}" effort="1.0" velocity="5.22"/>
+  </joint>
+
+  <!-- Joint-space joint: what the rest of the system (controllers, RViz, MoveIt) sees.
+       Prismatic, in meters, rack travel from fully open (0.0) to fully closed. -->
+  <joint name="gripper_joint" type="prismatic">
+    <parent link="gripper_motor_link"/>
+    <child link="gripper_finger_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="${gripper_open_m}" upper="${gripper_closed_m}" effort="50.0" velocity="0.5"/>
+  </joint>
+
+  <!-- Transmission: documents gripper_motor_joint (actuator, rad) <-> gripper_joint (joint, m).
+       Not applied by ros2_control or by sts_hardware_interface; kept as a record of the ratio. -->
+  <transmission name="gripper_transmission">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="gripper_joint">
+      <role>joint1</role>
+    </joint>
+    <actuator name="gripper_motor_joint">
+      <role>actuator1</role>
+      <mechanicalReduction>${gripper_mechanical_reduction}</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <!-- ros2_control hardware interface: unchanged from other examples in this package.
+       It only ever talks to gripper_motor_joint, in radians - it has no notion of the rack. -->
+  <ros2_control name="sts_system" type="system">
+    <hardware>
+      <plugin>sts_hardware_interface/STSHardwareInterface</plugin>
+
+      <!-- Required Parameters -->
+      <param name="serial_port">$(arg serial_port)</param>  <!-- Serial port path (e.g., /dev/ttyACM0) -->
+
+      <!-- Optional Hardware Parameters (with defaults shown) -->
+      <param name="baud_rate">$(arg baud_rate)</param>  <!-- Baud rate: 9600-1000000 (default: 1000000) -->
+      <param name="communication_timeout_ms">100</param>  <!-- Serial timeout: 1-1000 ms (default: 100) -->
+      <param name="use_sync_write">false</param>  <!-- Enable SyncWrite for multi-motor setups (default: true, disabled for single motor) -->
+      <param name="enable_mock_mode">$(arg use_mock)</param>  <!-- Simulation mode without hardware (default: false) -->
+      <param name="reset_states_on_activate">true</param>  <!-- Reset position/velocity to zero on activation (default: true) -->
+      <param name="hold_position_on_activate">false</param>  <!-- Seed position-mode commands from the real position on activation so servos hold still (default: false) -->
+    </hardware>
+
+    <joint name="gripper_motor_joint">
+      <!-- Required Joint Parameters -->
+      <param name="motor_id">$(arg motor_id)</param>  <!-- Motor ID on serial bus: 1-253 -->
+
+      <!-- Optional Joint Parameters (with defaults shown) -->
+      <param name="operating_mode">0</param>  <!-- 0=Position (servo), 1=Velocity (wheel), 2=PWM (effort) [default: 1] -->
+      <param name="min_position">0.0</param>  <!-- Min position limit in radians (default: 0.0) -->
+      <param name="max_position">${gripper_motor_max_rad}</param>  <!-- Max position limit in radians (default: 6.283, 2π); above 2π needs multi_turn -->
+
+      <!-- Multi-turn + sensorless homing (position mode only) -->
+      <param name="multi_turn">true</param>  <!-- Sets the servo's angle limits to 0 (multi-turn, ±7.5 turns) (default: false) -->
+      <param name="requires_homing">true</param>  <!-- Home against a hard stop on every activation (default: false) -->
+      <param name="homing_direction">-1</param>  <!-- Joint-space direction toward the stop: -1 = toward open/0 rad (default: -1) -->
+      <param name="homing_velocity">0.2</param>  <!-- Seek speed in rad/s - keep it slow (default: 0.5) -->
+      <param name="homing_load_threshold">0.03</param>  <!-- |load| fraction 0-1 that counts as "at the stop" (default: 0.3) -->
+      <param name="homing_debounce_cycles">5</param>  <!-- Consecutive ~10 ms polls above threshold (default: 5) -->
+      <param name="homing_position">0.0</param>  <!-- Joint position assigned to the stop, rad (default: 0.0) -->
+      <param name="homing_backoff">0.1</param>  <!-- Retract off the stop after triggering, rad (default: 0.1) -->
+      <!-- <param name="homing_max_travel">0.0</param> -->  <!-- Search distance, rad (default: 0 = 1.2 x position range) -->
+      <param name="homing_timeout_s">25.0</param>  <!-- Per phase (seek, backoff), seconds (default: 15); keep >= homing_max_travel / homing_velocity -->
+      <!-- <param name="allow_unhomed_commands">false</param> -->  <!-- Accept position commands before homing (default: false) -->
+      <param name="max_velocity_steps">3400</param>  <!-- Motor's max velocity in steps/s, model-dependent: STS3215=3400, STS3032=2900 (default: 3400) -->
+      <param name="max_velocity">5.22</param>  <!-- Max velocity limit in rad/s (default: 5.22, STS3215 max) -->
+      <!-- <param name="position_center_steps">4095</param> -->  <!-- Motor step mapped to 0 rad: 0-4095 (default: 4095 → [0, 2π); set to 2048 for [−π, +π]) -->
+
+      <!-- Optional EEPROM parameters (omit any line to preserve the existing EEPROM value): -->
+      <!-- <param name="p_coefficient">32</param> -->   <!-- P gain (0-255): addr 21 (Mode 0) -->
+      <!-- <param name="d_coefficient">32</param> -->   <!-- D gain (0-255): addr 22 (Mode 0 only; ignored in Mode 1/2) -->
+      <!-- <param name="i_coefficient">0</param> -->    <!-- I gain (0-255): addr 23 (Mode 0), addr 39 (Mode 1) -->
+      <!-- <param name="protection_current">462</param> -->  <!-- Hardware current cutoff (0-65535, 6.5mA units; 462 ≈ 3.0A): addr 28/29 -->
+      <!-- <param name="overload_torque">80</param> -->      <!-- Load threshold for overload protection (0-254): addr 36 -->
+      <!-- <param name="return_delay">0</param> -->          <!-- Response delay (0-254, 2µs units): addr 7 -->
+      <!-- <param name="deadband">2</param> -->              <!-- Position insensitive-area (0-255): addr 26/27 (CW_DEAD/CCW_DEAD), both set to the same value (Mode 0 only; ignored in Mode 1/2) -->
+
+      <!-- Command Interfaces (Mode 0: Position) -->
+      <command_interface name="position"/>  <!-- Target position in radians -->
+      <command_interface name="velocity"/>  <!-- Max speed in rad/s -->
+      <command_interface name="acceleration"/>  <!-- Acceleration value: 0-254 (unitless protocol value) -->
+
+      <!-- State Interfaces (always exported, declarations optional but recommended) -->
+      <state_interface name="position"/>  <!-- Current position (radians) -->
+      <state_interface name="velocity"/>  <!-- Current velocity (rad/s) -->
+      <state_interface name="effort"/>  <!-- Motor load (-1.0 to +1.0, normalized) -->
+      <state_interface name="voltage"/>  <!-- Supply voltage (volts) -->
+      <state_interface name="temperature"/>  <!-- Internal temperature (°C) -->
+      <state_interface name="current"/>  <!-- Motor current draw (amperes) -->
+      <state_interface name="is_moving"/>  <!-- Motion status (1.0=moving, 0.0=stopped) -->
+    </joint>
+  </ros2_control>
+
+</robot>

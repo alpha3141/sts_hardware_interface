@@ -48,7 +48,8 @@ The STS Hardware Interface is a `ros2_control` SystemInterface plugin that conne
 - **on_init()** → parses URDF params; detects read-only joints (no `<command_interface>` entries → `torque=0`, excluded from all write loops); builds servo/velocity/PWM mode index groups
 - **on_configure()** → creates `/emergency_stop` service (even in mock mode); opens serial port; pings all motors; writes optional EEPROM params (PID coefficients, `protection_current`, `overload_torque`, `return_delay`, `deadband`, `internal_*` registers) per joint
 - **on_configure()** → creates `/one_key_calibration` (`sts_hardware_interface/srv/OneKeyCalibration`) unconditionally — calibration is mode-agnostic
-- **on_activate()** → `InitMotor(motor_id, mode, torque)` per joint — commanded joints: `torque=1`; read-only joints: `torque=0`. With `hold_position_on_activate=true`, each commanded position-mode joint's `position` command is then seeded from the motor's real position (retried per motor; activation fails if a position cannot be read) so the servo holds still instead of moving to the initial 0.0 command
+- **on_configure()** → creates `/home_joints` (`sts_hardware_interface/srv/HomeJoints`); for each `multi_turn` joint, writes both servo angle limits to 0 to enable multi-turn position control
+- **on_activate()** → `InitMotor(motor_id, mode, torque)` per joint — commanded joints: `torque=1`; read-only joints: `torque=0`. Each `requires_homing` joint is then homed (blocking; activation fails if homing fails, see [Multi-Turn Joints and Sensorless Homing](#multi-turn-joints-and-sensorless-homing)). With `hold_position_on_activate=true`, each commanded position-mode joint's `position` command is then seeded from the motor's real position (retried per motor; activation fails if a position cannot be read) so the servo holds still instead of moving to the initial 0.0 command
 - **Active cycle** → `read()` sends one SyncRead request for every motor's feedback block, then collects each motor's reply (7 state interfaces); the whole read is time-boxed by `read_cycle_budget_ms`, and a motor that is skipped keeps its last state; `write()` uses SyncWrite per mode group when `use_sync_write=true` and >1 joint/group, else individual writes; read-only joints excluded from all write groups
 - **on_deactivate()** → `stop_motor()` per joint (individual writes), `EnableTorque(0)` all joints; returns to INACTIVE — may call `on_activate()` again or `on_cleanup()` to close serial
 - **on_cleanup() / on_shutdown()** → disables torque, closes serial port
@@ -61,7 +62,7 @@ Each motor can be configured independently in one of three modes:
 
 | Mode | Use Case | Command Interfaces | Position Limits | Velocity Semantics |
 | --- | --- | --- | --- | --- |
-| **0: Position** | Arm joints, precise positioning | position, velocity†(optional), acceleration†(optional) | 0 to 2π radians (configurable) | Maximum speed during position move |
+| **0: Position** | Arm joints, precise positioning | position, velocity†(optional), acceleration†(optional) | 0 to 2π radians (configurable); about ±7.5 turns with `multi_turn` | Maximum speed during position move |
 | **1: Velocity** | Wheels, continuous rotation | velocity, acceleration†(optional) | Unlimited | Target velocity for continuous rotation |
 | **2: PWM/Effort** | Force control, grippers, open-loop | effort (-1.0 to +1.0) | N/A | N/A (open-loop, no feedback control) |
 
@@ -124,6 +125,88 @@ Behavior:
   <param name="motor_id">3</param>
   <param name="operating_mode">2</param>
   <param name="max_effort">0.8</param>
+</joint>
+```
+
+---
+
+## Multi-Turn Joints and Sensorless Homing
+
+Some mechanisms, such as a rack-and-pinion gripper, need more than one revolution of the servo. In position mode the servo clamps every goal position to its angle limits (EEPROM addrs 9–12, default 0–4095, i.e. one revolution). Setting both limits to 0 switches it to multi-turn position control. The goal and present position registers are then signed (sign in bit 15), with a range of ±30719 steps, about ±7.5 turns.
+
+The servo does not keep its turn count across a power cycle. After power-up it reports a position within one revolution, so a multi-turn joint's position is only known up to whole turns. Sensorless homing gives the joint a known reference again: it drives the joint slowly against a mechanical hard stop and uses the rise in motor load to detect when it gets there.
+
+**⚠️ Untested on hardware:** the multi-turn range and the power-up behavior come from the Feetech memory table, and homing has mock-mode unit tests only. Verify both on a bench before relying on them.
+
+### Multi-turn (`multi_turn=true`)
+
+- `on_configure()` writes both angle limits to 0 (`WriteAngleLimits`, one EEPROM unlock/write/lock cycle). The setting persists in the servo's EEPROM. To return a servo to single-turn, write its angle limits back to 0 and 4095 with a servo tool; setting `multi_turn=false` does not restore them.
+- Position commands are clamped to ±30719 raw steps instead of 0–4095. The joint's `min_position`/`max_position` still apply as usual, so set them to the real travel.
+- A multi-turn joint should also set `requires_homing=true`. Without it, `on_init()` logs a warning, because the reported position may be off by whole revolutions after a power cycle.
+
+### Homing (`requires_homing=true`)
+
+Homing runs in `on_activate()` on every activation, after torque is enabled. While inactive the joint has no torque and may have been moved by hand, so every activation homes again. Homing blocks: `on_activate()` does not return until homing finishes or fails. The joint stays in position mode throughout, so no mode switch (and no EEPROM write) is needed.
+
+1. **Seek:** command a position target `homing_max_travel` away in `homing_direction`, at `homing_velocity`. The far target doubles as the travel limit.
+2. **Detect:** poll position and load every ~10 ms. Once `|load| >= homing_load_threshold` for `homing_debounce_cycles` consecutive polls, the joint is at the stop. The debounce filters out short load spikes, for example while accelerating.
+3. **Reference:** hold at the current position and set the joint's position center so that this point reads as `homing_position`. This replaces `position_center_steps` for the joint until the next homing.
+4. **Back off:** move `homing_backoff` away from the stop, so the joint is not left pushing against it. The joint ends at `homing_position − homing_direction × homing_backoff`, and its `position` state and command are both set to that value, so the first `write()` does not move it.
+
+Homing fails, and `on_activate()` returns `ERROR`, if:
+
+- no stop is detected within `homing_timeout_s`
+- the joint travels the full `homing_max_travel` without the load reaching the threshold
+- feedback cannot be read 5 times in a row
+- the backoff does not reach its target within `homing_timeout_s`
+
+On a failure the joint is commanded to hold where it is.
+
+**Tuning:**
+
+- Start with a low `homing_velocity` and watch the `effort` state while the joint runs freely and while it pushes against the stop. Set `homing_load_threshold` clearly between the two values.
+- The servo's own overload protection (`overload_torque`, protection time) must not trip before the threshold is reached. If it does, the servo cuts torque and homing times out.
+- `homing_max_travel` defaults to 1.2 × (`max_position` − `min_position`), because the joint can start anywhere in its travel.
+
+### Command gating
+
+Until a `requires_homing` joint is homed, `write()` ignores its position commands and logs a throttled warning. Other joints are still written. A cycle that skips a joint uses individual writes instead of SyncWrite for the position-mode group, because SyncWrite sends a command to every ID. Set `allow_unhomed_commands=true` on a joint to send its commands anyway, using whatever position reference it currently has (for bench setups).
+
+A joint loses its homed state, and must be homed again with `/home_joints`, after:
+
+- **automatic error recovery**, for `multi_turn` joints only. The dropout may have been a servo power loss, which resets the turn count.
+- **one-key calibration** of that joint, because `CalibrationOfs` shifts the raw encoder position the reference was based on.
+
+### Home Joints Service
+
+- Service: `/home_joints`
+- Type: `sts_hardware_interface/srv/HomeJoints`
+- Request: `motor_ids` (`uint16[]`). Empty homes every `requires_homing` joint.
+- Response: `success` (`bool`), `message` (`string`)
+
+The service is refused if the hardware interface is not active, an emergency stop is active, a one-key calibration is queued, or a requested motor is unknown or not configured with `requires_homing`. Joints are homed one after another, and the call stops at the first failure.
+
+The callback runs inside `read()` (via `spin_some`), so **a call blocks the control loop for the whole homing run**. Expect overrun warnings from the controller manager. Call it only when the joint is not in use.
+
+```bash
+ros2 service call /home_joints sts_hardware_interface/srv/HomeJoints "{motor_ids: []}"
+```
+
+**Configuration Example** (rack-and-pinion gripper, homing against the open stop at 0 rad; see [config/gripper_rack_pinion.urdf.xacro](../config/gripper_rack_pinion.urdf.xacro)):
+
+```xml
+<joint name="gripper_motor_joint">
+  <param name="motor_id">1</param>
+  <param name="operating_mode">0</param>
+  <param name="min_position">0.0</param>
+  <param name="max_position">12.566</param>  <!-- 720° -->
+  <param name="multi_turn">true</param>
+  <param name="requires_homing">true</param>
+  <param name="homing_direction">-1</param>
+  <param name="homing_velocity">0.5</param>
+  <param name="homing_load_threshold">0.3</param>
+  <param name="homing_backoff">0.1</param>
+  <command_interface name="position"/>
 </joint>
 ```
 
@@ -237,7 +320,7 @@ Configure these at the `<hardware>` level in your URDF:
 **Protocol Constants (hardcoded, same for all STS motors):**
 
 - `max_acceleration`: 254 (protocol limit for acceleration byte)
-- `max_position`: 4095 (12-bit encoder, 0-4095 steps)
+- `max_position`: 4095 (12-bit encoder, 0-4095 steps); ±30719 for `multi_turn` joints
 - `max_pwm`: 1000 (PWM duty cycle range)
 
 ### Joint Parameters
@@ -265,6 +348,19 @@ Configure these per `<joint>` in your URDF:
 | `internal_max_acc` | int | *(omit)* | 0–254 | Internal acceleration cap register written to EEPROM. Firmware-dependent on STS models. Addr 85. Omit to preserve existing EEPROM value. |
 | `internal_acc_coeff` | int | *(omit)* | 0–254 | Internal acceleration-profile coefficient written to EEPROM. Firmware-dependent on STS models. Addr 86. Omit to preserve existing EEPROM value. |
 | `internal_control_period` | int | *(omit)* | 1–254 | Internal control-loop period register written to EEPROM. Firmware-dependent on STS models. Addr 81. Omit to preserve existing EEPROM value. |
+| `multi_turn` | bool | false | true/false | Mode 0 only. Writes both angle limits (addrs 9–12) to 0 in `on_configure()`, enabling multi-turn position control (±30719 steps, about ±7.5 turns). See [Multi-Turn Joints and Sensorless Homing](#multi-turn-joints-and-sensorless-homing). |
+| `requires_homing` | bool | false | true/false | Mode 0 only, commanded joints. Home the joint against a hard stop on every activation; position commands are ignored until it is homed. |
+| `allow_unhomed_commands` | bool | false | true/false | Send position commands for a `requires_homing` joint even before it is homed. |
+| `homing_direction` | int | -1 | -1, 1 | Joint-space direction toward the hard stop. |
+| `homing_velocity` | double | 0.5 | > 0.0 | Seek and backoff speed (rad/s). Keep it slow. |
+| `homing_load_threshold` | double | 0.3 | (0.0, 1.0] | `\|load\|` (same scale as the `effort` state) that counts as "at the stop". |
+| `homing_debounce_cycles` | int | 5 | ≥ 1 | Consecutive polls (~10 ms apart) above the threshold needed to trigger. |
+| `homing_position` | double | 0.0 | any | Joint position (rad) assigned to the hard stop. |
+| `homing_backoff` | double | 0.1 | ≥ 0.0 | Distance (rad) to retract from the stop after triggering. |
+| `homing_max_travel` | double | 1.2 × position range | ≥ 0.0 | Distance (rad) searched before homing fails. `0` uses the default. |
+| `homing_timeout_s` | double | 15.0 | > 0.0 | Time limit (s) for each phase (seek, backoff). |
+
+The `homing_*` parameters are only read when `requires_homing=true`. Setting `multi_turn` or `requires_homing` on a joint that is not a commanded Mode 0 joint is an error.
 
 **Notes on EEPROM parameters (`p/d/i_coefficient`, `protection_current`, `overload_torque`, `return_delay`, `deadband`, `internal_max_vel`, `internal_max_acc`, `internal_acc_coeff`, `internal_control_period`):**
 
@@ -401,6 +497,7 @@ The hardware interface automatically recovers from communication failures:
 3. Ping all motors to verify presence
 4. Reinitialize each motor with configured operating mode
 5. Re-enable torque on commanded joints (readonly joints remain torque-disabled)
+6. Mark `multi_turn` homing joints as not homed: their position commands are ignored until `/home_joints` is called (the dropout may have been a power loss, which resets the servo's turn count)
 
 **Recovery Failure:**
 - If recovery fails, hardware interface transitions to ERROR state
@@ -472,6 +569,8 @@ Test controllers without hardware by setting `enable_mock_mode: true` in hardwar
 **Emergency Stop Behavior:**
 Mock mode emergency stop clears the velocity, position and effort command interfaces. Acceleration is left unchanged: it has no effect once those are cleared, and position-mode joints rely on a non-zero default (`DEFAULT_ACCELERATION`, 100) when no `acceleration` interface is declared.
 
+**Homing:** succeeds immediately. The joint's position state and command are set to its post-homing position (`homing_position − homing_direction × homing_backoff`) without simulating the seek.
+
 Mock mode provides realistic command/state behavior for controller development without hardware.
 
 ---
@@ -499,6 +598,7 @@ The position conversion uses a configurable center parameter — the raw encoder
 - **Motor units:** 0-4095 steps (12-bit resolution)
 - **ROS 2 units:** Depends on `position_center_steps`: default (4095) gives [0, 2π), center=2048 gives approximately [−π, +π]
 - **Conversion:** `radians = (center - steps) × (2π / 4096)` — includes REP-103 direction inversion; `center` defaults to 4095 (configurable per joint via `position_center_steps`)
+- **Multi-turn joints:** the same formula applies, but raw positions may be negative or above 4095, and commands are clamped to ±30719 steps. Homing sets the center at runtime, replacing `position_center_steps`.
 - **Note:** Commands outside the encoder range are clamped to [0, 4095] steps (not wrapped). A center of 2048 produces a slight asymmetry: the range is approximately (not exactly) [−π, +π] because 4096 steps cover exactly 2π but the encoder has only 4096 discrete positions (0–4095), leaving one encoder step of asymmetry at the ±π boundary.
 
 ### Velocity Conversion
