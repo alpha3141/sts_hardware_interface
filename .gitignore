@@ -39,3 +39,6 @@ graphify-out/
 
 # colcon
 COLCON_IGNORE
+
+# build conda packages
+*.conda

@@ -14,6 +14,12 @@ backend = { name = "pixi-build-ros", version = "*"}
 [package.build.config]
 distro = "jazzy"
 
+extra-input-globs = [
+    "**/*.xacro",
+    "**/*.urdf",
+]
+
+
 
 [dependencies]
 ros-jazzy-sts-hardware-interface = { path = "." }
