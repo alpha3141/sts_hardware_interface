@@ -32,20 +32,24 @@ colcon build --packages-select sts_hardware_interface
 ```
 
 ## Quick Start with Pixi
+
+```bash
+git clone https://github.com/alpha3141/sts_hardware_interface.git
+cd sts_hardware_interface
+
+# Install dependencies and build the ROS 2 package as a conda package
+pixi install
+
+# Open a pixi shell with the built ROS 2 package
+pixi shell
 ```
-git clone https://github.com/adityakamath/sts_hardware_interface.git
-pixi install # install required dependencies and builds the ros2 package as a conda package
 
-pixi shell # opens a pixi shell with the build ros2 package
-
-ros2 launch sts_hardware_interface single_motor_position.launch.py 
-
-
+### Run a launch file
+```bash
+ros2 launch sts_hardware_interface single_motor_position.launch.py
 ```
 
-
-
-The [Quick Start guide](docs/quick-start.md) covers the example launch files and hardware setup.
+The [Quick Start guide](docs/quick-start.md#running-the-examples) covers the example launch files and hardware setup in more detail.
 
 ## URDF Configuration
 
