@@ -122,7 +122,7 @@ install(FILES sts_hardware_interface.xml
 # Install launch files
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
-  FILES_MATCHING PATTERN "*.py"
+  FILES_MATCHING PATTERN "*.py" PATTERN "*.xml" PATTERN "*.yaml"
 )
 
 # Install config files

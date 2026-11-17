@@ -17,6 +17,8 @@ distro = "jazzy"
 extra-input-globs = [
     "**/*.xacro",
     "**/*.urdf",
+    "**/*.xml",
+    "**/*.yaml",
 ]
 
 

@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!--
+  Launch file for a rack-and-pinion gripper on one multi-turn STS motor.
+
+  The motor is homed against the gripper's open hard stop when the hardware interface activates
+  (see requires_homing in gripper_rack_pinion.urdf.xacro), so the gripper moves on startup.
+  The gripper_controller (joint trajectory controller) then commands the pinion angle in radians.
+
+  Example usage:
+    ros2 launch sts_hardware_interface gripper_rack_pinion.launch.xml serial_port:=/dev/ttyACM0
+    ros2 launch sts_hardware_interface gripper_rack_pinion.launch.xml use_mock:=true
+-->
+<launch>
+  <arg name="serial_port" default="/dev/ttyACM0" description="Serial port for STS motor communication"/>
+  <arg name="motor_id"    default="1"            description="Motor ID (1-253)"/>
+  <arg name="baud_rate"   default="1000000"      description="Serial baud rate"/>
+  <arg name="use_mock"    default="false"        description="Use mock/simulation mode (no hardware required)"/>
+
+  <let name="robot_description"
+       value="$(command 'xacro $(find-pkg-share sts_hardware_interface)/config/gripper_rack_pinion.urdf.xacro serial_port:=$(var serial_port) motor_id:=$(var motor_id) baud_rate:=$(var baud_rate) use_mock:=$(var use_mock)')"/>
+
+  <!-- type="str" keeps the URDF from being parsed as YAML (like ParameterValue(value_type=str)) -->
+  <node pkg="robot_state_publisher" exec="robot_state_publisher" output="both">
+    <param name="robot_description" type="str" value="$(var robot_description)"/>
+  </node>
+
+  <node pkg="controller_manager" exec="ros2_control_node" output="both">
+    <param name="robot_description" type="str" value="$(var robot_description)"/>
+    <param from="$(find-pkg-share sts_hardware_interface)/config/gripper_rack_pinion_controllers.yaml"/>
+  </node>
+
+  <node pkg="controller_manager" exec="spawner"
+        args="joint_state_broadcaster state_interfaces_broadcaster gripper_controller --controller-manager /controller_manager"/>
+</launch>
