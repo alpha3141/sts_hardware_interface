@@ -547,6 +547,20 @@ int SMS_STS::WriteAngleLimits(u8 ID, u16 minLimit, u16 maxLimit)
 	return LockEeprom(ID);
 }
 
+int SMS_STS::WriteMultiTurnFeedback(u8 ID, bool enable)
+{
+	const int phase = readByteRegister(*this, ID, SMS_STS_PHASE);
+	if (phase < 0) {
+		return 0;
+	}
+	const u8 desired = enable ? static_cast<u8>(phase | SMS_STS_PHASE_MULTI_TURN_FEEDBACK)
+	                          : static_cast<u8>(phase & ~SMS_STS_PHASE_MULTI_TURN_FEEDBACK);
+	if (desired == phase) {
+		return 1;  // Already set: skip the EEPROM write
+	}
+	return writeLockedByte(*this, ID, SMS_STS_PHASE, desired);
+}
+
 int SMS_STS::ReadDeadband(u8 ID)
 {
 	return readByteRegister(*this, ID, SMS_STS_CW_DEAD);

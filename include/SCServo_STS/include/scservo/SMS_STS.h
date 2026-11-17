@@ -45,6 +45,7 @@
 #define SMS_STS_MAX_TORQUE_L 16
 #define SMS_STS_MAX_TORQUE_H 17
 #define SMS_STS_PHASE 18
+#define SMS_STS_PHASE_MULTI_TURN_FEEDBACK 0x10  // Phase BIT4: 0 = single-turn angle feedback, 1 = multi-turn
 #define SMS_STS_UNLOADING_CONDITION 19
 #define SMS_STS_LED_ALARM_CONDITION 20
 #define SMS_STS_MODE0_P_COEF 21
@@ -278,6 +279,10 @@ class SMS_STS : public SCSerial
 	virtual int ReadDeadband(u8 ID);
 	/** @brief Write min/max angle limits (addr 9-12). Both 0 enables multi-turn position control in Mode 0. */
 	virtual int WriteAngleLimits(u8 ID, u16 minLimit, u16 maxLimit);
+	/** @brief Set/clear Phase register (addr 18) bit 4: Present Position reports the multi-turn angle
+	 *  instead of the single-turn 0-4095 angle. Read-modify-write; skips the EEPROM write if unchanged.
+	 *  Source: Feetech memory table (Juxi wiki), python-st3215, ESPHome st3215 component. */
+	virtual int WriteMultiTurnFeedback(u8 ID, bool enable);
 	virtual int WriteMovingThreshold(u8 ID, u8 value);
 	virtual int ReadMovingThreshold(u8 ID);
 	virtual int WriteDTS(u8 ID, u8 value);

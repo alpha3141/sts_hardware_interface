@@ -815,8 +815,15 @@ hardware_interface::CallbackReturn STSHardwareInterface::on_configure(
           joint.motor_id, joint.name.c_str(), r->c_str());
         return hardware_interface::CallbackReturn::ERROR;
       }
-      RCLCPP_INFO(logger_, "Motor %d (joint '%s'): multi-turn enabled (angle limits set to 0)",
-        joint.motor_id, joint.name.c_str());
+      // Without Phase bit 4 Present Position stays single-turn (wraps at 0/4095) while goals are
+      // multi-turn: readback and goal frames then disagree by whole turns.
+      if (auto r = check(servo_->WriteMultiTurnFeedback(joint.motor_id, true), "WriteMultiTurnFeedback"); r.has_value()) {
+        RCLCPP_ERROR(logger_, "Motor %d (joint '%s'): enable multi-turn position feedback: %s",
+          joint.motor_id, joint.name.c_str(), r->c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+      }
+      RCLCPP_INFO(logger_, "Motor %d (joint '%s'): multi-turn enabled (angle limits 0, phase register 0x%02X)",
+        joint.motor_id, joint.name.c_str(), servo_->readByte(static_cast<u8>(joint.motor_id), SMS_STS_PHASE));
     }
   }
 
